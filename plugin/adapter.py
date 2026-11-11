@@ -170,6 +170,9 @@ class XAdapter(BasePlatformAdapter):
             if event.id not in seen:
                 bursts.setdefault(event.conversation_id, []).append(event)
         for burst in bursts.values():
+            if self._message_handler is None:
+                # Drain landed during the GET or an earlier burst's admission: leave the rest unmarked.
+                return
             seen.update(dict.fromkeys(e.id for e in burst))
             # Mark at admission: handle_message returns before the model turn runs, so marking
             # after send() would re-run a paid turn every poll while X rejects the reply.

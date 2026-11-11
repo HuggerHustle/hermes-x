@@ -127,6 +127,8 @@ def parse_dm_events(body: dict[str, object]) -> list[DmEvent]:
             created_at = datetime.fromisoformat(created)
         except ValueError:
             continue
+        if created_at.tzinfo is None:  # pending_events compares it with an aware "now"
+            continue
         events.append(DmEvent(event_id, conv, sender, text, created_at))
     return events
 

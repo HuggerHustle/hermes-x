@@ -115,15 +115,18 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
    - X `402` on send returns a non-retryable failure; `402` on poll does not crash the gateway.
    - A hung `xurl` is killed at the timeout.
 5. **`x` toolset and platform config.** In the VM's `config.yaml`:
-   - `platform_toolsets.x: [search, no_mcp]`. Without `no_mcp`, Hermes adds every enabled MCP
-     server to the platform (`hermes_cli/tools_config.py:752`). No `memory`: that tool writes
+   - `platform_toolsets.x: [search, todo, no_mcp]`. `todo` keeps Hermes off its composite rules,
+     which add `x_search` when xAI credentials exist. Without `no_mcp`, Hermes adds every enabled
+     MCP server to the platform (`hermes_cli/tools_config.py:752`). No `memory`: that tool writes
      `MEMORY.md`, which is loaded into owner and cron sessions that do have a shell.
      Conversation follow-ups come from the session transcript, not from `memory`.
    - `platforms.x.allow_admin_from: ["2112799656950259712"]` (the bot's own id, so no stranger is
      admin) and `platforms.x.gateway_restart_notification: false`.
+   - `known_plugin_toolsets.x` lists every plugin toolset key, else Hermes adds them all to X, and
+     `platforms.x.unauthorized_dm_behavior: ignore` (no pairing-code DMs). See `docs/deploy.md`.
    - Checks before go-live, through the X channel: the live session's tool list is exactly
-     `web_search`; the `touch /tmp/pwned-by-dm` DM runs nothing; a `/model` DM is answered as
-     text; an `@file:` DM gets no file content back.
+     `web_search` and `todo_list`; the `touch /tmp/pwned-by-dm` DM runs nothing; a `/model` DM is
+     answered as text; an `@file:` DM gets no file content back.
 6. **Deploy.**
    - Read-only deploy key on the VM for this repo.
    - `hermes plugins install "git@github.com:HuggerHustle/hermes-x-platform.git#plugin"
@@ -168,6 +171,10 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
   can refresh the same token while the gateway polls. The plugin's lock does not cover them.
 - **Cost.** Polling is one paid X API call per tick: 288 a day at 5 minutes. Webhooks (Account
   Activity API, higher tier, public endpoint, CRC handler) are out of scope.
+- **Busy acknowledgments are paid DMs.** A DM that arrives while that conversation's turn is still
+  running gets one busy acknowledgment per 30 s (`gateway/run_busy.py:1036`); `display_tier`
+  only strips its detail. The only off switch, `display.busy_ack_enabled`, is global. Needs a turn
+  longer than one poll; accepted.
 - **Mentions are out of scope.** Public replies fall under stricter X automation rules; follow-up
   ticket.
 
@@ -176,4 +183,5 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
 - Repo name `hermes-x-platform`.
 - OPS-30: only the X part is covered here.
 - Toolset `search`, not `web`: `web_extract` would let a stranger make Huggy fetch a URL they pick.
+- `todo` in the X toolset list: it keeps `x_search` off on a host with xAI credentials.
 - No cron delivery to X.
