@@ -27,9 +27,9 @@ conversation with follow-ups, and a narrow per-platform toolset.
 ## Repo
 
 Private `HuggerHustle/hermes-x-platform`, checked out at `~/Projects/huggerhustle/hermes-x-platform`.
-Tooling mirrors `crawler`: `uv`, Python 3.14, black + isort + ruff + mypy strict, pytest with
-pytest-asyncio, `AGENTS.md` with a `CLAUDE.md` pointer. Ruff also selects `ASYNC`, so a blocking
-call inside `async def` fails lint.
+Tooling mirrors `crawler`: `uv`, Python 3.14 for dev, black + isort + ruff + mypy strict, pytest
+with pytest-asyncio, `AGENTS.md` with a `CLAUDE.md` pointer. Ruff also selects `ASYNC`, so a
+blocking call inside `async def` fails lint. `plugin/` targets Python 3.11+, like Hermes.
 
 The plugin lives in `plugin/` and only that directory is installed on the VM. Hermes treats a
 `pyproject.toml` with `[build-system]` or `[dependency-groups]` inside a plugin directory as
@@ -90,6 +90,10 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
    - **First start seeds, does not answer.** With empty storage the adapter records the newest
      event id and replies to nothing older, so cutover cannot double-answer what the stopgap
      already handled.
+   - **Read only what is new.** Next to the seen ids the store keeps a cursor: the newest event
+     time at the last finished poll. A poll asks for 20 events at a time and pages back to the
+     cursor or the 24-hour line, five pages at most. Only a finished poll moves the cursor, so a
+     drain or crash re-reads the gap and the seen ids skip what was already handed over.
    - New DMs from one conversation in one poll become one `MessageEvent`, texts joined by a blank
      line. A second `handle_message()` on a busy session interrupts the running turn at the
      default `busy_input_mode` (`gateway/run_busy.py:1022`), and that setting is per profile, not
@@ -99,7 +103,8 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
    - No delivery-ledger row and no retry or plain-text fallback send (`_record_delivery_obligation`,
      `_send_retry_is_final`): either would re-send a DM. `display_tier="minimal"` keeps interim
      and long-running notices out of DMs, since each is a paid POST.
-   - `X_POLL_SECONDS` has a floor of 60 (GET allows 15 calls per 15 minutes).
+   - `X_POLL_SECONDS` has a floor of 60 (GET allows 15 calls per 15 minutes). A poll makes one
+     call, up to five in a burst; past the limit it fails and the next tick retries.
    - `send()` posts to `/2/dm_conversations/{id}/messages` and strips markdown, like the SMS
      adapter. On X `402` it returns `SendResult(success=False, retryable=False,
      error_kind="unknown")`: `forbidden` would mark the conversation dead, but a 402 means the
@@ -162,15 +167,22 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
   poll, Huggy still answers the person's DM.
 - **Corrupt seen-id store.** It is renamed to `seen.corrupt` and re-seeded, so DMs since the last
   good poll get no reply; the gateway log says so.
-- **One page per poll.** More than 100 DM events between two polls drops the oldest.
+- **Five pages per poll.** More than 100 DM events between two polls: the oldest get no reply,
+  and the gateway log says so.
+- **The cursor skips late events.** Nothing older than the newest event of the last finished poll
+  is answered. An event X delivers late, with an older timestamp, gets no reply.
+- **Paging assumes newest first.** X does not document the order of `/2/dm_events`. If it were
+  oldest first, no DM would be answered; go-live check 1 shows it either way.
 - **402 shape is a guess.** X does not document the body; detection matches a `CreditsDepleted`
   title or a `credits` type, else it is a generic API error.
 - **Hermes expands `@` references for every platform.** Upstream should skip expansion when
   `allow_gateway_control=False`; the plugin's word joiner is the local fix.
 - **`xurl` token refresh outside the plugin.** Owner and cron sessions that use the `xurl` skill
   can refresh the same token while the gateway polls. The plugin's lock does not cover them.
-- **Cost.** Polling is one paid X API call per tick: 288 a day at 5 minutes. Webhooks (Account
-  Activity API, higher tier, public endpoint, CRC handler) are out of scope.
+- **Cost.** X bills reads per event returned ($0.010), counted once per UTC day, and each reply
+  ($0.015). A poll asks for 20 events and pages back only to the cursor, so an idle inbox costs
+  about $0.20 a day. Webhooks (Account Activity API, higher tier, public endpoint, CRC handler)
+  are out of scope.
 - **Busy acknowledgments are paid DMs.** A DM that arrives while that conversation's turn is still
   running gets one busy acknowledgment per 30 s (`gateway/run_busy.py:1036`); `display_tier`
   only strips its detail. The only off switch, `display.busy_ack_enabled`, is global. Needs a turn

@@ -16,10 +16,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 LIST_PATH = (
-    "/2/dm_events?max_results=100&event_types=MessageCreate"
+    "/2/dm_events?event_types=MessageCreate"
     "&dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id"
 )
 MAX_AGE = timedelta(hours=24)
+# Reads are billed per event returned: small pages, read only back to the caller's floor.
+PAGE_SIZE = 20
+MAX_PAGES = 5
+_PAGE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")  # it goes into the URL query
 # 1:1 conversations are "<id>-<id>"; group conversations are a single id.
 _ONE_TO_ONE = re.compile(r"^\d+-\d+$")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -134,12 +138,16 @@ def parse_dm_events(body: dict[str, object]) -> list[DmEvent]:
 
 
 def pending_events(
-    events: list[DmEvent], me: str, now: datetime, max_age: timedelta = MAX_AGE
+    events: list[DmEvent],
+    me: str,
+    now: datetime,
+    max_age: timedelta = MAX_AGE,
+    since: datetime | None = None,
 ) -> list[DmEvent]:
-    """Inbound events in 1:1 conversations that include ``me``, newer than ``max_age``, oldest
-    first. Dedupe is the caller's seen-id store: a follow-up sent while we were replying is older
-    than our reply and must still count. A wrong ``me`` matches no conversation, so our own
-    replies are never read back as inbound."""
+    """Inbound events in 1:1 conversations that include ``me``, newer than ``max_age`` and not
+    older than ``since``, oldest first. Dedupe is the caller's seen-id store: a follow-up sent
+    while we were replying is older than our reply and must still count. A wrong ``me`` matches
+    no conversation, so our own replies are never read back as inbound."""
     pending = [
         e
         for e in events
@@ -147,6 +155,7 @@ def pending_events(
         and me in e.conversation_id.split("-")
         and e.sender_id != me
         and now - e.created_at <= max_age
+        and (since is None or e.created_at >= since)
     ]
     return sorted(pending, key=lambda e: e.created_at)
 
@@ -190,9 +199,27 @@ class XClient:
             raise _api_error(body)
         return body
 
-    async def list_dm_events(self) -> list[DmEvent]:
-        # shortcut: one page of 100; a burst of >100 events between polls drops the oldest.
-        return parse_dm_events(await self._run(LIST_PATH))
+    async def list_dm_events(self, floor: datetime) -> tuple[list[DmEvent], bool]:
+        """Events newest first, paged back until one is older than ``floor``. The flag is False
+        when ``MAX_PAGES`` ran out first, so older events since ``floor`` were never read."""
+        events: list[DmEvent] = []
+        token = ""
+        for _ in range(MAX_PAGES):
+            query = f"&max_results={PAGE_SIZE}" + (f"&pagination_token={token}" if token else "")
+            body = await self._run(LIST_PATH + query)
+            page = parse_dm_events(body)
+            events.extend(page)
+            if any(e.created_at < floor for e in page):
+                return events, True
+            meta = body.get("meta")
+            token = str(meta.get("next_token") or "") if isinstance(meta, dict) else ""
+            if not token:
+                return events, True
+            if not _PAGE_TOKEN.match(token):
+                logger.warning("X: unexpected next_token %r; reading no further", token[:40])
+                return events, False
+        logger.warning("X: more than %d DM events since the last poll", MAX_PAGES * PAGE_SIZE)
+        return events, False
 
     async def send_dm(self, conversation_id: str, text: str) -> str:
         """Post ``text`` to a 1:1 conversation; returns the new DM event id."""

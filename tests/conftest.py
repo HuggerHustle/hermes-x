@@ -46,7 +46,12 @@ class FakeXurl:
         self._write("post.json", stdout, exit, sleep, stderr)
 
     def events(self, *events: dict[str, Any]) -> None:
-        self.get(stdout=json.dumps({"data": list(events), "meta": {"result_count": len(events)}}))
+        """Serve ``events`` (newest first, as X does) in pages."""
+        spec = {"events": list(events), "exit": 0, "sleep": 0, "stderr": ""}
+        (self.root / "get.json").write_text(json.dumps(spec))
+
+    def list_calls(self) -> list[dict[str, Any]]:
+        return [c for c in self.calls() if "POST" not in c["argv"]]
 
     def calls(self) -> list[dict[str, Any]]:
         log = self.root / "calls.jsonl"

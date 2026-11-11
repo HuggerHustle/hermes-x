@@ -56,10 +56,6 @@ X_ALLOW_ALL_USERS=true
 
 ## 3. Install
 
-`hermes --version` must print `Python: 3.14.x`: `plugin/` uses 3.14-only syntax
-(`except A, B:`), which is a `SyntaxError` on 3.11–3.13. Hermes v0.23.1 pins 3.14.9
-(`pm/lock.json`).
-
 ```sh
 hermes plugins install "git@github.com:HuggerHustle/hermes-x-platform.git#plugin" \
   --ref <40-char sha> --enable
@@ -104,5 +100,12 @@ The plugin logs as `X:` in the gateway log. Messages worth knowing:
 
 - `seen-id store unreadable ... re-seeding`: the store was renamed to `seen.corrupt`. DMs since
   the last good poll got no reply; check the inbox.
-- `no DM conversation includes X_USER_ID`: `X_USER_ID` is wrong.
+- `no DM conversation includes X_USER_ID`: `X_USER_ID` is wrong. Nothing is answered and the
+  cursor stays, so DMs from the last 24 h get answered once the id is fixed.
 - `DM poll failed (CreditsDepleted)`: the X API balance is empty; polling retries each tick.
+- `DM read stopped before the cursor; older DMs get no reply`: the poll could not read back to
+  the last one, after `more than 100 DM events since the last poll` or `unexpected next_token`.
+  Check the inbox.
+- A send failure naming `EncryptionRequired` or `UnencryptedSendNotAllowed`: that person can be
+  reached only over encrypted X Chat, which this plugin does not speak. This reading comes from
+  X's API reference, not from a seen failure.

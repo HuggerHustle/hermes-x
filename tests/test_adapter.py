@@ -234,7 +234,18 @@ async def test_follow_up_sent_during_reply_is_admitted(
     assert [e.message_id for e in _events(handler)] == ["A", "B"]
 
 
-@pytest.mark.parametrize("bad", ["", '{"seen": ["1"', '["1"]', '{"seen": null}'])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        '{"seen": ["1"',
+        '["1"]',
+        '{"seen": null}',
+        '{"seen": [], "cursor": "nope"}',
+        '{"seen": [], "cursor": "2026-11-11T12:00:00"}',  # no offset
+        '{"seen": [], "cursor": 5}',
+    ],
+)
 async def test_corrupt_seen_store_reseeds_then_answers_new(
     adapter: XAdapter,
     fake_xurl: FakeXurl,
@@ -317,3 +328,135 @@ def test_poll_seconds_from_env_with_floor(
     assert XAdapter(config)._poll_seconds == 120
     monkeypatch.setenv("X_POLL_SECONDS", "5")
     assert XAdapter(config)._poll_seconds == 60
+
+
+def _at(seconds_ago: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def _burst(n: int, conv: str = CONV, sender: str = THEM, offset: int = 0) -> list[dict[str, Any]]:
+    """``n`` DMs, newest first (as X returns them), one second apart."""
+    return [
+        dm(f"{conv}-{offset + i}", sender=sender, conv=conv, created_at=_at(offset + i))
+        for i in range(n)
+    ]
+
+
+def _cursor(adapter: XAdapter) -> str | None:
+    value: str | None = json.loads(adapter._seen_path().read_text())["cursor"]
+    return value
+
+
+async def test_idle_poll_after_restart_reads_one_small_page(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_xurl.events(*_burst(25))
+    await adapter._poll_once()  # seed reads both pages back to the 24 h line
+    assert len(fake_xurl.list_calls()) == 2
+    restarted = XAdapter(PlatformConfig(enabled=True, extra={"user_id": ME}))
+    restarted.set_message_handler(AsyncMock())
+    handler = _capture(restarted, monkeypatch)
+    await restarted._poll_once()
+    calls = fake_xurl.list_calls()
+    assert len(calls) == 3  # the cursor survived the restart: one more call
+    assert "max_results=20" in calls[-1]["argv"][2]
+    assert handler.call_count == 0
+
+
+async def test_burst_over_one_page_is_read_and_answered(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed on an empty inbox
+    burst = _burst(30)
+    fake_xurl.events(*burst)
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()
+    assert len(fake_xurl.list_calls()) == 1 + 2
+    [event] = _events(handler)
+    assert event.message_id == burst[0]["id"]  # newest
+    assert event.text.count("hi") == 30
+    assert _cursor(adapter) == datetime.fromisoformat(burst[0]["created_at"]).isoformat()
+
+
+async def test_drain_keeps_cursor_so_skipped_dm_is_answered_later(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed: empty inbox, no cursor
+    other = f"{ME}-777"
+    a1, b2, a3 = (
+        dm("a1", created_at=_at(500)),
+        dm("b2", sender="777", conv=other, created_at=_at(400)),
+        dm("a3", created_at=_at(300)),
+    )
+    fake_xurl.events(a3, b2, a1)
+
+    async def drain_after_first(event: MessageEvent) -> None:
+        adapter.set_message_handler(None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(adapter, "handle_message", drain_after_first)
+    await adapter._poll_once()  # conversation A admitted, then drain: B never handed over
+    assert _cursor(adapter) is None  # not moved past b2
+    adapter.set_message_handler(AsyncMock())
+    handler = _capture(adapter, monkeypatch)
+    fake_xurl.events(*_burst(25, conv=f"{ME}-888", sender="888"), a3, b2, a1)
+    await adapter._poll_once()
+    admitted = {e.message_id for e in _events(handler)}
+    assert "b2" in admitted and "a3" not in admitted
+
+
+async def test_nothing_older_than_the_cursor_is_answered(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = dm("1", created_at=_at(10))
+    fake_xurl.events(first)
+    await adapter._poll_once()  # seed: cursor at event 1
+    handler = _capture(adapter, monkeypatch)
+    fake_xurl.events(first, dm("late", created_at=_at(20)))  # shows up after the cursor moved
+    await adapter._poll_once()
+    assert handler.call_count == 0
+
+
+async def test_more_than_five_pages_warns_and_answers_what_was_read(
+    adapter: XAdapter,
+    fake_xurl: FakeXurl,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await adapter._poll_once()  # seed
+    burst = _burst(110)
+    fake_xurl.events(*burst)
+    handler = _capture(adapter, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        await adapter._poll_once()
+    assert len(fake_xurl.list_calls()) == 1 + 5
+    assert "more than 100 DM events" in caplog.text
+    assert "older DMs get no reply" in caplog.text
+    [event] = _events(handler)
+    assert event.text.count("hi") == 100
+    assert _cursor(adapter) is not None
+
+
+async def test_store_without_cursor_is_read_not_reseeded(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter._seen_path().parent.mkdir(parents=True, exist_ok=True)
+    adapter._seen_path().write_text('{"seen": ["1"]}')  # written before the cursor existed
+    fake_xurl.events(dm("2"), dm("1"))
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()
+    assert [e.message_id for e in _events(handler)] == ["2"]
+
+
+async def test_wrong_user_id_keeps_the_cursor(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed
+    dms = (dm("3", created_at=_at(1)), dm("2", sender="77", conv=f"77-{ME}", created_at=_at(60)))
+    fake_xurl.events(*dms)
+    wrong = XAdapter(PlatformConfig(enabled=True, extra={"user_id": "999"}))
+    wrong.set_message_handler(AsyncMock())
+    await wrong._poll_once()
+    assert _cursor(adapter) is None
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()  # id fixed: both DMs are still answered
+    assert sorted(str(e.message_id) for e in _events(handler)) == ["2", "3"]

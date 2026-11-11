@@ -19,7 +19,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import cancel_task, send_chunks, strip_markdown
 from plugins.plugin_storage import plugin_data_dir
 
-from .x_api import DmEvent, XApiError, XClient, find_xurl, pending_events
+from .x_api import MAX_AGE, DmEvent, XApiError, XClient, find_xurl, pending_events
 
 if TYPE_CHECKING:
     from hermes_cli.plugins_context import PluginContext
@@ -27,7 +27,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_SECONDS = 300
-# GET /2/dm_events allows 15 calls per 15 minutes per user.
+# GET /2/dm_events allows 15 calls per 15 minutes per user; a poll makes 1 call, up to 5 in a
+# burst. Past the limit a poll fails and the next tick retries (same-day re-reads are not billed).
 MIN_POLL_SECONDS = 60
 MAX_SEEN = 2000
 PLATFORM_HINT = (
@@ -51,7 +52,7 @@ class XAdapter(BasePlatformAdapter):
             poll = int(
                 extra_or_secret(extra, "poll_seconds", "X_POLL_SECONDS", DEFAULT_POLL_SECONDS)
             )
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             poll = DEFAULT_POLL_SECONDS
         self._poll_seconds = max(poll, MIN_POLL_SECONDS)
         self._api = XClient(find_xurl() or "xurl")
@@ -117,14 +118,16 @@ class XAdapter(BasePlatformAdapter):
     def _seen_path(self) -> Path:
         return plugin_data_dir("x") / "seen.json"
 
-    def _load_seen(self) -> dict[str, None] | None:
-        """Seen event ids in insertion order, or None when there is no usable store (re-seed)."""
+    def _load_seen(self) -> tuple[dict[str, None], datetime | None] | None:
+        """Seen event ids in insertion order and the cursor (newest event time at the last
+        finished poll), or None when there is no usable store (re-seed)."""
         path = self._seen_path()
         try:
             raw = json.loads(path.read_text())
             ids = raw["seen"] if isinstance(raw, dict) else None
             if not isinstance(ids, list):
                 raise ValueError(f"no 'seen' list in {path}")
+            cursor = _parse_cursor(raw.get("cursor"))
         except FileNotFoundError:
             return None
         except (OSError, ValueError, KeyError) as exc:
@@ -137,13 +140,14 @@ class XAdapter(BasePlatformAdapter):
                 exc,
             )
             return None
-        return dict.fromkeys(i for i in ids if isinstance(i, str))
+        return dict.fromkeys(i for i in ids if isinstance(i, str)), cursor
 
-    def _save_seen(self, seen: dict[str, None]) -> None:
+    def _save_seen(self, seen: dict[str, None], cursor: datetime | None) -> None:
         path = self._seen_path()
         tmp = path.with_suffix(".tmp")
+        store = {"seen": list(seen)[-MAX_SEEN:], "cursor": cursor.isoformat() if cursor else None}
         with tmp.open("w") as f:
-            json.dump({"seen": list(seen)[-MAX_SEEN:]}, f)
+            json.dump(store, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -152,21 +156,31 @@ class XAdapter(BasePlatformAdapter):
         if self._message_handler is None:
             # Gateway drain withdrew ingress; marking now would drop the DM for good.
             return
-        events = await self._api.list_dm_events()
-        seen = self._load_seen()
-        if seen is None:
+        now = datetime.now(UTC)
+        store = self._load_seen()
+        cursor = store[1] if store else None
+        # Read back only to the cursor: events are billed per event returned.
+        floor = now - MAX_AGE if cursor is None else max(cursor, now - MAX_AGE)
+        events, complete = await self._api.list_dm_events(floor)
+        newest = max([e.created_at for e in events] + ([cursor] if cursor else []), default=None)
+        if store is None:
             # First start: mark what is there, answer nothing (cutover from the stopgap).
-            self._save_seen(dict.fromkeys(e.id for e in events))
+            self._save_seen(dict.fromkeys(e.id for e in events), newest)
             logger.info("X: first start, seeded %d existing DM events", len(events))
             return
+        seen = store[0]
         if events and not any(self._user_id in e.conversation_id.split("-") for e in events):
+            # Keep the cursor: once the id is fixed, these DMs must still be answered.
             logger.warning(
                 "X: no DM conversation includes X_USER_ID %s; is it wrong?", self._user_id
             )
+            return
+        if not complete:
+            logger.warning("X: DM read stopped before the cursor; older DMs get no reply")
         # One turn per conversation per poll: a second handle_message() on a busy session
         # interrupts the running turn at the default busy_input_mode (gateway/run_busy.py:1022).
         bursts: dict[str, list[DmEvent]] = {}
-        for event in pending_events(events, self._user_id, datetime.now(UTC)):
+        for event in pending_events(events, self._user_id, now, since=cursor):
             if event.id not in seen:
                 bursts.setdefault(event.conversation_id, []).append(event)
         for burst in bursts.values():
@@ -176,8 +190,11 @@ class XAdapter(BasePlatformAdapter):
             seen.update(dict.fromkeys(e.id for e in burst))
             # Mark at admission: handle_message returns before the model turn runs, so marking
             # after send() would re-run a paid turn every poll while X rejects the reply.
-            self._save_seen(seen)
+            self._save_seen(seen, cursor)
             await self.handle_message(self._to_message_event(burst))
+        # Only a finished poll moves the cursor: after a drain the next poll re-reads the gap.
+        if newest != cursor:
+            self._save_seen(seen, newest)
 
     def _to_message_event(self, burst: list[DmEvent]) -> MessageEvent:
         event = burst[-1]
@@ -215,6 +232,15 @@ class XAdapter(BasePlatformAdapter):
         while True:
             await self._poll_safely()
             await asyncio.sleep(self._poll_seconds)
+
+
+def _parse_cursor(value: object) -> datetime | None:
+    if value is None:
+        return None
+    cursor = datetime.fromisoformat(value) if isinstance(value, str) else None
+    if cursor is None or cursor.tzinfo is None:
+        raise ValueError(f"bad cursor {value!r}")
+    return cursor
 
 
 def _user_id_env() -> str:
