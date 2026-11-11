@@ -198,3 +198,17 @@ def test_list_skips_non_message_create() -> None:
 
     body: dict[str, object] = {"data": [dm("1", event_type="ParticipantsJoin"), dm("2")]}
     assert [e.id for e in parse_dm_events(body)] == ["2"]
+
+
+def test_list_skips_timestamps_without_offset() -> None:
+    # A naive time would make every poll raise in pending_events and stall all DMs.
+    from plugin.x_api import parse_dm_events
+
+    body: dict[str, object] = {
+        "data": [
+            dm("1", created_at="2026-11-11T12:00:00"),
+            dm("2", created_at="2022-08-12T17:33:34.000Z"),
+        ]
+    }
+    assert [e.id for e in parse_dm_events(body)] == ["2"]
+    assert pending_events(parse_dm_events(body), ME, NOW, max_age=timedelta(days=9999))

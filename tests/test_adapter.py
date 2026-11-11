@@ -197,6 +197,27 @@ async def test_no_poll_while_ingress_withdrawn(
     assert [e.message_id for e in _events(handler)] == ["7"]
 
 
+async def test_drain_during_poll_leaves_unadmitted_dms_unmarked(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed
+    other = f"{ME}-777"
+    fake_xurl.events(dm("2"), dm("3", sender="777", conv=other))
+    admitted: list[str] = []
+
+    async def handler(event: MessageEvent) -> None:
+        admitted.append(str(event.message_id))
+        await asyncio.sleep(0)  # admission yields to the loop...
+        adapter.set_message_handler(None)  # type: ignore[arg-type]  # ...and drain lands here
+
+    monkeypatch.setattr(adapter, "handle_message", handler)
+    await adapter._poll_once()
+    seen = set(json.loads(adapter._seen_path().read_text())["seen"])
+    assert len(admitted) == 1
+    assert admitted[0] in seen
+    assert ({"2", "3"} - set(admitted)).isdisjoint(seen)  # answered after the restart
+
+
 async def test_follow_up_sent_during_reply_is_admitted(
     adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
