@@ -1,0 +1,27 @@
+name: x
+label: X
+kind: platform
+version: 0.1.0
+description: >
+  X (Twitter) classic Direct Message gateway for Hermes Agent. Polls DMs through the
+  xurl CLI and answers each 1:1 conversation as its own session. Stdlib only.
+author: HuggerHustle
+requires_hermes: ">=0.23"
+requires_env:
+  - name: X_USER_ID
+    description: "Numeric X user id of the account the bot answers as"
+    prompt: "X user id"
+    password: false
+optional_env:
+  - name: X_POLL_SECONDS
+    description: "Seconds between DM polls (default 300, minimum 60)"
+    prompt: "Poll interval in seconds"
+    password: false
+  - name: X_ALLOWED_USERS
+    description: "Comma-separated X user ids allowed to talk to the bot"
+    prompt: "Allowed X user ids (comma-separated)"
+    password: false
+  - name: X_ALLOW_ALL_USERS
+    description: "Allow anyone who DMs the account to talk to the bot"
+    prompt: "Allow all users? (true/false)"
+    password: false

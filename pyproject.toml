@@ -1,0 +1,68 @@
+[project]
+name = "hermes-x-platform"
+version = "0.1.0"
+description = "Hermes Agent gateway platform plugin for X (Twitter) classic DMs"
+requires-python = ">=3.14,<3.15"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "black>=25.1",
+    "hermes-agent",
+    "isort>=6.0",
+    "mypy>=1.17",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.12",
+]
+
+[tool.uv]
+package = false
+environments = ["python_version >= '3.14'"]
+# Copied from Hermes v0.23.1 pyproject.toml [tool.uv]: uv applies overrides only from the root
+# project, and Hermes's core deps do not resolve without them. Re-copy when the pin moves.
+override-dependencies = [
+    "pynacl>=1.6,<1.7",
+    "cryptography==50.0.2",
+    "Pillow==13.0.0",
+    "spacy-curated-transformers; sys_platform == 'never'",
+]
+
+[tool.uv.sources]
+hermes-agent = { git = "ssh://git@github.com/NousResearch/hermes-agent.git", tag = "v0.23.1" }
+
+# Hermes's setup.py refuses wheel builds unless this is set (setup.py:33).
+[tool.uv.extra-build-variables]
+hermes-agent = { HERMES_NIX_BUILD = "1" }
+
+[tool.black]
+line-length = 100
+target-version = ["py314"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+src = ["plugin", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "T20", "RUF", "ASYNC"]
+ignore = ["E501"]  # black owns line length; it cannot wrap long strings
+
+[tool.mypy]
+strict = true
+files = ["plugin", "tests"]
+
+# Hermes ships no py.typed. Following its source keeps real signatures, so an XAdapter override
+# that drifts from BasePlatformAdapter fails mypy. Errors inside Hermes itself stay silent.
+[[tool.mypy.overrides]]
+module = ["agent", "agent.*", "gateway", "gateway.*", "plugins", "plugins.*", "hermes_cli", "hermes_cli.*"]
+follow_untyped_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
