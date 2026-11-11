@@ -47,5 +47,8 @@ channels.
   never `os.getenv`.
 - An event id is marked seen before `handle_message()`. A DM is never re-sent: a lost reply beats
   a double reply or a repeated paid turn.
+- Only a finished poll moves the cursor in `seen.json`; an early return (drain) leaves it, so the
+  next poll re-reads what was skipped.
+- `plugin/` code runs on Python 3.11+: ruff (`py311`) fails on newer syntax, so keep that target.
 - Every `xurl` call goes through `XClient._run`: one lock, a hard timeout, the child killed on
   timeout or cancel.

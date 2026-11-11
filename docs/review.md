@@ -12,7 +12,7 @@ against a scratch `HERMES_HOME`, not only read.
 | #   | Finding                        | Severity | Resolution                                  |
 | --- | ------------------------------ | -------- | ------------------------------------------- |
 | 1   | Extra toolsets reach X         | High     | `deploy.md`: `todo`, `known_plugin_toolsets` |
-| 2   | `except A, B:` needs 3.14      | Low      | `deploy.md`: Python version check           |
+| 2   | `except A, B:` needs 3.14      | Low      | parenthesized; Black and ruff target 3.11   |
 | 3   | Pairing-code DMs to strangers  | Medium   | `deploy.md`: `unauthorized_dm_behavior`     |
 | 4   | Drain race drops a DM          | Medium   | `adapter.py`: check before each mark        |
 | 5   | Naive timestamp stalls polling | Low      | `x_api.py`: skip rows without an offset     |
@@ -59,8 +59,8 @@ Hermes v0.23.1 pins its runtime to CPython 3.14.9 (`pm/lock.json` in the Hermes 
 standard install runs 3.14. Changing the line to `except (TypeError, ValueError):` does not stick:
 Black with `target-version = ["py314"]` rewrites it back.
 
-Resolution (`docs/deploy.md`): before install, `hermes --version` must print `Python: 3.14.x`. If
-huggy ever runs older Python, change the line and Black's `target-version` together.
+Resolution: the line is parenthesized, and `pyproject.toml` sets Black's `target-version` to
+3.11–3.14 and ruff's to `py311`, so ruff fails on any syntax newer than 3.11 in `plugin/`.
 
 ### 3. Pairing-code DMs to strangers (Medium)
 
@@ -119,7 +119,7 @@ handled. The blocking write has no such gap.
 ### 8. Seed order in `seen.json` (no change)
 
 True: the seed stores ids newest first, later polls append oldest first. A seeded id is trimmed
-only after 1,900 newer inbound DMs, long after it left the 100-event page, so order never changes
+only after 1,900 newer inbound DMs, long after the cursor passed it, so order never changes
 which DM is answered.
 
 ## Not in the first review

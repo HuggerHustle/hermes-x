@@ -18,6 +18,7 @@ from plugin.x_api import (
 )
 
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+FLOOR = datetime.now(UTC) - timedelta(hours=24)
 CREDITS_BODY = json.dumps(
     {
         "title": "CreditsDepleted",
@@ -33,7 +34,8 @@ def ev(event_id: str, sender: str = THEM, minutes_ago: int = 0, conv: str = CONV
 
 async def test_list_parses_events_and_uses_oauth2(fake_xurl: FakeXurl) -> None:
     fake_xurl.events(dm("1", text="hello"), {"id": "bad"})  # malformed rows are dropped
-    events = await XClient(fake_xurl.binary).list_dm_events()
+    events, complete = await XClient(fake_xurl.binary).list_dm_events(FLOOR)
+    assert complete
     assert [(e.id, e.text, e.sender_id, e.conversation_id) for e in events] == [
         ("1", "hello", THEM, CONV)
     ]
@@ -45,7 +47,7 @@ async def test_list_parses_events_and_uses_oauth2(fake_xurl: FakeXurl) -> None:
 
 async def test_list_with_no_data_is_empty(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout='{"meta": {"result_count": 0}}')
-    assert await XClient(fake_xurl.binary).list_dm_events() == []
+    assert await XClient(fake_xurl.binary).list_dm_events(FLOOR) == ([], True)
 
 
 async def test_send_posts_json_to_conversation(fake_xurl: FakeXurl) -> None:
@@ -73,7 +75,7 @@ async def test_send_rejects_non_conversation_id(fake_xurl: FakeXurl) -> None:
 async def test_402_is_credits_depleted(fake_xurl: FakeXurl, body: str) -> None:
     fake_xurl.get(stdout=body, exit=1, stderr="\x1b[31mError: request failed\x1b[0m")
     with pytest.raises(CreditsDepleted):
-        await XClient(fake_xurl.binary).list_dm_events()
+        await XClient(fake_xurl.binary).list_dm_events(FLOOR)
 
 
 @pytest.mark.parametrize(
@@ -93,7 +95,7 @@ async def test_rate_limit(fake_xurl: FakeXurl, body: str) -> None:
 async def test_transport_error_uses_stderr(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(exit=1, stderr="\x1b[31mError: HTTP Error: 502 Bad Gateway\x1b[0m\n")
     with pytest.raises(XApiError, match="502 Bad Gateway") as info:
-        await XClient(fake_xurl.binary).list_dm_events()
+        await XClient(fake_xurl.binary).list_dm_events(FLOOR)
     assert info.value.error_kind == "transient"
     assert "\x1b" not in str(info.value)
 
@@ -101,7 +103,7 @@ async def test_transport_error_uses_stderr(fake_xurl: FakeXurl) -> None:
 async def test_ok_exit_with_errors_and_no_data_is_error(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout=json.dumps({"errors": [{"title": "Not Found"}]}))
     with pytest.raises(XApiError):
-        await XClient(fake_xurl.binary).list_dm_events()
+        await XClient(fake_xurl.binary).list_dm_events(FLOOR)
 
 
 def _alive(pid: int) -> bool:
@@ -116,7 +118,7 @@ async def test_hung_xurl_is_killed_at_timeout(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout="{}", sleep=30)
     start = time.monotonic()
     with pytest.raises(XurlTimeout):
-        await XClient(fake_xurl.binary, timeout=1.0).list_dm_events()
+        await XClient(fake_xurl.binary, timeout=1.0).list_dm_events(FLOOR)
     assert time.monotonic() - start < 10  # killed, not waited out
     [pid] = fake_xurl.pids()
     assert not _alive(pid)
@@ -124,7 +126,7 @@ async def test_hung_xurl_is_killed_at_timeout(fake_xurl: FakeXurl) -> None:
 
 async def test_cancellation_kills_the_child(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout="{}", sleep=30)
-    task = asyncio.create_task(XClient(fake_xurl.binary).list_dm_events())
+    task = asyncio.create_task(XClient(fake_xurl.binary).list_dm_events(FLOOR))
     for _ in range(100):  # wait for the child to start
         await asyncio.sleep(0.05)
         if (fake_xurl.root / "pids").exists() and fake_xurl.pids():
@@ -141,7 +143,7 @@ async def test_cancellation_kills_the_child(fake_xurl: FakeXurl) -> None:
 async def test_lock_serializes_calls(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout="{}", sleep=0.3)
     client = XClient(fake_xurl.binary)
-    await asyncio.gather(client.list_dm_events(), client.send_dm(CONV, "x"))
+    await asyncio.gather(client.list_dm_events(FLOOR), client.send_dm(CONV, "x"))
     first, second = sorted(fake_xurl.calls(), key=lambda c: c["start"])
     assert first["end"] <= second["start"]
 
@@ -178,7 +180,7 @@ async def test_xurl_config_env_is_scrubbed(
     fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CLIENT_ID", "other-app")
-    await XClient(fake_xurl.binary).list_dm_events()
+    await XClient(fake_xurl.binary).list_dm_events(FLOOR)
     assert fake_xurl.calls()[0]["client_id_env"] is False
 
 
@@ -212,3 +214,39 @@ def test_list_skips_timestamps_without_offset() -> None:
     }
     assert [e.id for e in parse_dm_events(body)] == ["2"]
     assert pending_events(parse_dm_events(body), ME, NOW, max_age=timedelta(days=9999))
+
+
+def _rows(n: int) -> list[dict[str, object]]:
+    """``n`` events newest first, one minute apart."""
+    now = datetime.now(UTC)
+    return [dm(str(i), created_at=(now - timedelta(minutes=i)).isoformat()) for i in range(n)]
+
+
+async def test_list_pages_back_to_the_floor_only(fake_xurl: FakeXurl) -> None:
+    fake_xurl.events(*_rows(45))
+    client = XClient(fake_xurl.binary)
+    floor = datetime.now(UTC) - timedelta(minutes=10)
+    events, complete = await client.list_dm_events(floor)
+    assert complete and len(events) == 20  # page 1 already reaches past the floor
+    assert len(fake_xurl.calls()) == 1
+    events, complete = await client.list_dm_events(datetime.now(UTC) - timedelta(hours=24))
+    assert complete and [e.id for e in events] == [str(i) for i in range(45)]
+    assert ["pagination_token=tok20" in c["argv"][2] for c in fake_xurl.calls()[1:]] == [
+        False,
+        True,
+        False,
+    ]
+
+
+async def test_list_stops_on_a_strange_next_token(fake_xurl: FakeXurl) -> None:
+    body = {"data": [dm("1")], "meta": {"next_token": "../users/me"}}
+    fake_xurl.get(stdout=json.dumps(body))
+    events, complete = await XClient(fake_xurl.binary).list_dm_events(FLOOR)
+    assert [e.id for e in events] == ["1"] and complete is False
+    assert len(fake_xurl.calls()) == 1
+
+
+def test_pending_drops_events_older_than_since() -> None:
+    events = [ev("old", minutes_ago=5), ev("new", minutes_ago=1)]
+    since = NOW - timedelta(minutes=3)
+    assert [e.id for e in pending_events(events, ME, NOW, since=since)] == ["new"]
