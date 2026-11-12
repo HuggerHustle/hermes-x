@@ -215,6 +215,7 @@ async def test_drain_during_poll_leaves_unadmitted_dms_unmarked(
     seen = set(json.loads(adapter._seen_path().read_text())["seen"])
     assert len(admitted) == 1
     assert admitted[0] in seen
+    assert _cursor(adapter) is None
     assert ({"2", "3"} - set(admitted)).isdisjoint(seen)  # answered after the restart
 
 
@@ -366,9 +367,11 @@ async def test_idle_poll_after_restart_reads_one_small_page(
 async def test_burst_over_one_page_is_read_and_answered(
     adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await adapter._poll_once()  # seed on an empty inbox
+    old = dm("old", created_at=_at(3600))
+    fake_xurl.events(old)
+    await adapter._poll_once()  # seed: the cursor is at "old", as in production
     burst = _burst(30)
-    fake_xurl.events(*burst)
+    fake_xurl.events(*burst, old)
     handler = _capture(adapter, monkeypatch)
     await adapter._poll_once()
     assert len(fake_xurl.list_calls()) == 1 + 2
@@ -381,24 +384,27 @@ async def test_burst_over_one_page_is_read_and_answered(
 async def test_drain_keeps_cursor_so_skipped_dm_is_answered_later(
     adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await adapter._poll_once()  # seed: empty inbox, no cursor
+    old = dm("old", created_at=_at(3600))
+    fake_xurl.events(old)
+    await adapter._poll_once()  # seed: the cursor is at "old"
+    seeded = _cursor(adapter)
     other = f"{ME}-777"
     a1, b2, a3 = (
         dm("a1", created_at=_at(500)),
         dm("b2", sender="777", conv=other, created_at=_at(400)),
         dm("a3", created_at=_at(300)),
     )
-    fake_xurl.events(a3, b2, a1)
+    fake_xurl.events(a3, b2, a1, old)
 
     async def drain_after_first(event: MessageEvent) -> None:
         adapter.set_message_handler(None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(adapter, "handle_message", drain_after_first)
     await adapter._poll_once()  # conversation A admitted, then drain: B never handed over
-    assert _cursor(adapter) is None  # not moved past b2
+    assert _cursor(adapter) == seeded  # not moved past b2
     adapter.set_message_handler(AsyncMock())
     handler = _capture(adapter, monkeypatch)
-    fake_xurl.events(*_burst(25, conv=f"{ME}-888", sender="888"), a3, b2, a1)
+    fake_xurl.events(*_burst(25, conv=f"{ME}-888", sender="888"), a3, b2, a1, old)
     await adapter._poll_once()
     admitted = {e.message_id for e in _events(handler)}
     assert "b2" in admitted and "a3" not in admitted
@@ -460,3 +466,78 @@ async def test_wrong_user_id_keeps_the_cursor(
     handler = _capture(adapter, monkeypatch)
     await adapter._poll_once()  # id fixed: both DMs are still answered
     assert sorted(str(e.message_id) for e in _events(handler)) == ["2", "3"]
+
+
+async def test_drain_during_the_read_marks_nothing(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed
+    before = adapter._seen_path().read_text()
+    fake_xurl.events(dm("2"))
+    read = adapter._api.list_dm_events
+
+    async def read_then_drain(floor: datetime) -> Any:
+        events = await read(floor)
+        adapter.set_message_handler(None)  # type: ignore[arg-type]
+        return events
+
+    monkeypatch.setattr(adapter._api, "list_dm_events", read_then_drain)
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()
+    assert handler.call_count == 0
+    assert adapter._seen_path().read_text() == before
+
+
+async def test_group_chat_is_not_a_wrong_user_id(
+    adapter: XAdapter,
+    fake_xurl: FakeXurl,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await adapter._poll_once()  # seed
+    fake_xurl.events(dm("g2", sender="77", conv="1234567890", created_at=_at(1)))
+    handler = _capture(adapter, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        await adapter._poll_once()
+    assert "X_USER_ID" not in caplog.text
+    assert _cursor(adapter) is not None  # the cursor moves past the group message
+    assert handler.call_count == 0
+
+
+async def test_read_error_keeps_the_store(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+    from pathlib import Path
+
+    await adapter._poll_once()  # seed
+    fake_xurl.events(dm("2"))
+
+    def no_handles(self: Path, *args: Any, **kwargs: Any) -> str:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", no_handles)
+        with pytest.raises(OSError):
+            await adapter._poll_once()
+    assert not adapter._seen_path().with_suffix(".corrupt").exists()
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()  # the next poll answers what waited
+    assert [e.message_id for e in _events(handler)] == ["2"]
+
+
+async def test_backlog_admits_only_what_x_lets_us_answer(
+    adapter: XAdapter, fake_xurl: FakeXurl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await adapter._poll_once()  # seed
+    waiting = [
+        dm(f"d{i}", sender=f"7{i}", conv=f"7{i}-{ME}", created_at=_at(60 - i)) for i in range(7)
+    ]
+    fake_xurl.events(*reversed(waiting))
+    handler = _capture(adapter, monkeypatch)
+    await adapter._poll_once()  # 300 s poll: 15 sends / 3 polls = 5 conversations
+    assert [e.message_id for e in _events(handler)] == [f"d{i}" for i in range(5)]
+    assert _cursor(adapter) is None  # held, so the rest are read again
+    await adapter._poll_once()
+    assert [e.message_id for e in _events(handler)][5:] == ["d5", "d6"]
+    assert _cursor(adapter) is not None

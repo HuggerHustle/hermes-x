@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 from datetime import UTC, datetime
@@ -31,6 +32,8 @@ DEFAULT_POLL_SECONDS = 300
 # burst. Past the limit a poll fails and the next tick retries (same-day re-reads are not billed).
 MIN_POLL_SECONDS = 60
 MAX_SEEN = 2000
+# POST /2/dm_conversations/:id/messages allows 15 sends per 15 minutes per user.
+SENDS_PER_15_MIN = 15
 PLATFORM_HINT = (
     "You are Huggy from HuggerHustle, answering an X (Twitter) Direct Message from a member of "
     "the public. X shows plain text only: no markdown, no headings, no tables. Keep replies short "
@@ -130,7 +133,7 @@ class XAdapter(BasePlatformAdapter):
             cursor = _parse_cursor(raw.get("cursor"))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError, KeyError) as exc:
+        except (ValueError, KeyError) as exc:  # an OSError fails this poll and keeps the file
             # Re-seed rather than answer the last 24h again: a double reply is worse than a lost one.
             with contextlib.suppress(OSError):
                 os.replace(path, path.with_suffix(".corrupt"))
@@ -161,7 +164,7 @@ class XAdapter(BasePlatformAdapter):
         cursor = store[1] if store else None
         # Read back only to the cursor: events are billed per event returned.
         floor = now - MAX_AGE if cursor is None else max(cursor, now - MAX_AGE)
-        events, complete = await self._api.list_dm_events(floor)
+        events = await self._api.list_dm_events(floor)
         newest = max([e.created_at for e in events] + ([cursor] if cursor else []), default=None)
         if store is None:
             # First start: mark what is there, answer nothing (cutover from the stopgap).
@@ -169,23 +172,28 @@ class XAdapter(BasePlatformAdapter):
             logger.info("X: first start, seeded %d existing DM events", len(events))
             return
         seen = store[0]
-        if events and not any(self._user_id in e.conversation_id.split("-") for e in events):
+        # Only 1:1 ids ("<id>-<id>") name both sides; a group id never holds ours.
+        pairs = [e.conversation_id.split("-") for e in events if "-" in e.conversation_id]
+        if pairs and not any(self._user_id in pair for pair in pairs):
             # Keep the cursor: once the id is fixed, these DMs must still be answered.
             logger.warning(
                 "X: no DM conversation includes X_USER_ID %s; is it wrong?", self._user_id
             )
             return
-        if not complete:
-            logger.warning("X: DM read stopped before the cursor; older DMs get no reply")
         # One turn per conversation per poll: a second handle_message() on a busy session
         # interrupts the running turn at the default busy_input_mode (gateway/run_busy.py:1022).
         bursts: dict[str, list[DmEvent]] = {}
+        # since=cursor: after a first start capped at MAX_PAGES, events older than the seed
+        # are not in seen; without it they would be answered once they leave the newest pages.
         for event in pending_events(events, self._user_id, now, since=cursor):
             if event.id not in seen:
                 bursts.setdefault(event.conversation_id, []).append(event)
-        for burst in bursts.values():
-            if self._message_handler is None:
-                # Drain landed during the GET or an earlier burst's admission: leave the rest unmarked.
+        # Turns past X's send limit would run, be paid for, and have their reply refused.
+        cap = SENDS_PER_15_MIN // math.ceil(900 / self._poll_seconds)
+        for n, burst in enumerate(bursts.values()):
+            if self._message_handler is None or n >= cap:
+                # Drain landed, or the send budget is spent: the rest stay unmarked, the cursor
+                # stays, and the next poll admits them.
                 return
             seen.update(dict.fromkeys(e.id for e in burst))
             # Mark at admission: handle_message returns before the model turn runs, so marking

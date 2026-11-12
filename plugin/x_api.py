@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,7 +24,6 @@ MAX_AGE = timedelta(hours=24)
 # Reads are billed per event returned: small pages, read only back to the caller's floor.
 PAGE_SIZE = 20
 MAX_PAGES = 5
-_PAGE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")  # it goes into the URL query
 # 1:1 conversations are "<id>-<id>"; group conversations are a single id.
 _ONE_TO_ONE = re.compile(r"^\d+-\d+$")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -157,7 +157,8 @@ def pending_events(
         and now - e.created_at <= max_age
         and (since is None or e.created_at >= since)
     ]
-    return sorted(pending, key=lambda e: e.created_at)
+    # X lists newest first and stamps whole seconds: reverse first so ties keep send order.
+    return sorted(reversed(pending), key=lambda e: e.created_at)
 
 
 class XClient:
@@ -199,27 +200,27 @@ class XClient:
             raise _api_error(body)
         return body
 
-    async def list_dm_events(self, floor: datetime) -> tuple[list[DmEvent], bool]:
-        """Events newest first, paged back until one is older than ``floor``. The flag is False
-        when ``MAX_PAGES`` ran out first, so older events since ``floor`` were never read."""
+    async def list_dm_events(self, floor: datetime) -> list[DmEvent]:
+        """Events newest first, paged back until one is older than ``floor`` or ``MAX_PAGES``
+        run out."""
         events: list[DmEvent] = []
         token = ""
         for _ in range(MAX_PAGES):
-            query = f"&max_results={PAGE_SIZE}" + (f"&pagination_token={token}" if token else "")
+            query = f"&max_results={PAGE_SIZE}" + (
+                f"&pagination_token={urllib.parse.quote(token, safe='')}" if token else ""
+            )
             body = await self._run(LIST_PATH + query)
             page = parse_dm_events(body)
             events.extend(page)
-            if any(e.created_at < floor for e in page):
-                return events, True
             meta = body.get("meta")
             token = str(meta.get("next_token") or "") if isinstance(meta, dict) else ""
-            if not token:
-                return events, True
-            if not _PAGE_TOKEN.match(token):
-                logger.warning("X: unexpected next_token %r; reading no further", token[:40])
-                return events, False
-        logger.warning("X: more than %d DM events since the last poll", MAX_PAGES * PAGE_SIZE)
-        return events, False
+            if not token or any(e.created_at < floor for e in page):
+                return events
+        logger.warning(
+            "X: more than %d DM events since the last poll; older DMs get no reply",
+            MAX_PAGES * PAGE_SIZE,
+        )
+        return events
 
     async def send_dm(self, conversation_id: str, text: str) -> str:
         """Post ``text`` to a 1:1 conversation; returns the new DM event id."""

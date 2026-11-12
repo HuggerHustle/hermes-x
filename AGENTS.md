@@ -38,7 +38,8 @@ channels.
 ## Rules
 
 - Hermes facts come from the `v0.23.1` source, the version on the VM. Before any `hermes update`
-  on huggy, bump the tag in `pyproject.toml` and run the tests against it.
+  on huggy, bump the tag in `pyproject.toml` and run the tests against it. After the update has
+  restarted the gateway, run go-live check 1 (`docs/deploy.md`).
 - `plugin/` imports only the standard library and Hermes. Hermes installs it as-is; a
   `pyproject.toml` there would make Hermes install packages into its own venv.
 - Every inbound `MessageEvent` has `allow_gateway_control=False`, and `@` before a letter gets a

@@ -34,8 +34,7 @@ def ev(event_id: str, sender: str = THEM, minutes_ago: int = 0, conv: str = CONV
 
 async def test_list_parses_events_and_uses_oauth2(fake_xurl: FakeXurl) -> None:
     fake_xurl.events(dm("1", text="hello"), {"id": "bad"})  # malformed rows are dropped
-    events, complete = await XClient(fake_xurl.binary).list_dm_events(FLOOR)
-    assert complete
+    events = await XClient(fake_xurl.binary).list_dm_events(FLOOR)
     assert [(e.id, e.text, e.sender_id, e.conversation_id) for e in events] == [
         ("1", "hello", THEM, CONV)
     ]
@@ -47,7 +46,7 @@ async def test_list_parses_events_and_uses_oauth2(fake_xurl: FakeXurl) -> None:
 
 async def test_list_with_no_data_is_empty(fake_xurl: FakeXurl) -> None:
     fake_xurl.get(stdout='{"meta": {"result_count": 0}}')
-    assert await XClient(fake_xurl.binary).list_dm_events(FLOOR) == ([], True)
+    assert await XClient(fake_xurl.binary).list_dm_events(FLOOR) == []
 
 
 async def test_send_posts_json_to_conversation(fake_xurl: FakeXurl) -> None:
@@ -226,11 +225,11 @@ async def test_list_pages_back_to_the_floor_only(fake_xurl: FakeXurl) -> None:
     fake_xurl.events(*_rows(45))
     client = XClient(fake_xurl.binary)
     floor = datetime.now(UTC) - timedelta(minutes=10)
-    events, complete = await client.list_dm_events(floor)
-    assert complete and len(events) == 20  # page 1 already reaches past the floor
+    events = await client.list_dm_events(floor)
+    assert len(events) == 20  # page 1 already reaches past the floor
     assert len(fake_xurl.calls()) == 1
-    events, complete = await client.list_dm_events(datetime.now(UTC) - timedelta(hours=24))
-    assert complete and [e.id for e in events] == [str(i) for i in range(45)]
+    events = await client.list_dm_events(datetime.now(UTC) - timedelta(hours=24))
+    assert [e.id for e in events] == [str(i) for i in range(45)]
     assert ["pagination_token=tok20" in c["argv"][2] for c in fake_xurl.calls()[1:]] == [
         False,
         True,
@@ -238,12 +237,16 @@ async def test_list_pages_back_to_the_floor_only(fake_xurl: FakeXurl) -> None:
     ]
 
 
-async def test_list_stops_on_a_strange_next_token(fake_xurl: FakeXurl) -> None:
-    body = {"data": [dm("1")], "meta": {"next_token": "../users/me"}}
+async def test_list_escapes_the_next_token(fake_xurl: FakeXurl) -> None:
+    body = {"data": [dm("1")], "meta": {"next_token": "a/b&c=d"}}
     fake_xurl.get(stdout=json.dumps(body))
-    events, complete = await XClient(fake_xurl.binary).list_dm_events(FLOOR)
-    assert [e.id for e in events] == ["1"] and complete is False
-    assert len(fake_xurl.calls()) == 1
+    await XClient(fake_xurl.binary).list_dm_events(FLOOR)
+    assert "&pagination_token=a%2Fb%26c%3Dd" in fake_xurl.calls()[1]["argv"][2]
+
+
+def test_pending_keeps_send_order_within_one_second() -> None:
+    newest_first = [ev("second"), ev("first")]  # same created_at, as X lists them
+    assert [e.id for e in pending_events(newest_first, ME, NOW)] == ["first", "second"]
 
 
 def test_pending_drops_events_older_than_since() -> None:
