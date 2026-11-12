@@ -26,7 +26,8 @@ conversation with follow-ups, and a narrow per-platform toolset.
 
 ## Repo
 
-Private `HuggerHustle/hermes-x-platform`, checked out at `~/Projects/huggerhustle/hermes-x-platform`.
+`HuggerHustle/hermes-x`, checked out at `~/Projects/huggerhustle/hermes-x`. The repo is public;
+the VM still installs over SSH with a deploy key, so making it private changes nothing there.
 Tooling mirrors `crawler`: `uv`, Python 3.14 for dev, black + isort + ruff + mypy strict, pytest
 with pytest-asyncio, `AGENTS.md` with a `CLAUDE.md` pointer. Ruff also selects `ASYNC`, so a
 blocking call inside `async def` fails lint. `plugin/` targets Python 3.11+, like Hermes.
@@ -57,8 +58,10 @@ member `Platform.SMS`, and there is no `Platform.X`. Env wiring goes straight in
 Env vars: `X_USER_ID` (required), `X_ALLOWED_USERS`, `X_ALLOW_ALL_USERS`, `X_POLL_SECONDS`
 (default 300).
 
-Not built: cron delivery to X (`X_HOME_CHANNEL`, `standalone_sender_fn`). Nothing needs Huggy to
-start a DM, and leaving it out means only the gateway process calls `xurl` for this plugin.
+Not built: cron delivery to X (`standalone_sender_fn`, `cron_deliver_env_var`). Nothing needs
+Huggy to start a DM, and leaving it out means only the gateway process calls `xurl` for this
+plugin. `X_HOME_CHANNEL` is still set, to the bot's own id: without it Hermes sends a
+"No home channel" notice on the first turn of every new conversation.
 
 ## Steps
 
@@ -74,8 +77,8 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
      token at the same time.
    - Keeps the stopgap's rules: 1:1 conversations that include `X_USER_ID`, `MessageCreate`
      events only, not our own messages, 24-hour window. Which events are new comes from the
-     seen-id store alone: an "other person spoke last" rule would drop a follow-up sent while
-     Huggy was replying.
+     seen-id store and the cursor, not from who spoke last: an "other person spoke last" rule
+     would drop a follow-up sent while Huggy was replying.
    - `--auth oauth2` on every call, and xurl's own config env vars removed from the child.
 3. **`adapter.py`.**
    - `connect()` takes `acquire_scoped_lock` (released in `disconnect()`) and starts a polling
@@ -120,8 +123,9 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
    - X `402` on send returns a non-retryable failure; `402` on poll does not crash the gateway.
    - A hung `xurl` is killed at the timeout.
 5. **`x` toolset and platform config.** In the VM's `config.yaml`:
-   - `platform_toolsets.x: [search, todo, no_mcp]`. `todo` keeps Hermes off its composite rules,
-     which add `x_search` when xAI credentials exist. Without `no_mcp`, Hermes adds every enabled
+   - `platform_toolsets.x: [search, context_engine, no_mcp]`. `context_engine` (no tool at the
+     default engine) keeps Hermes off its composite rules, which add `x_search` when xAI
+     credentials exist. Without `no_mcp`, Hermes adds every enabled
      MCP server to the platform (`hermes_cli/tools_config.py:752`). No `memory`: that tool writes
      `MEMORY.md`, which is loaded into owner and cron sessions that do have a shell.
      Conversation follow-ups come from the session transcript, not from `memory`.
@@ -130,16 +134,16 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
    - `known_plugin_toolsets.x` lists every plugin toolset key, else Hermes adds them all to X, and
      `platforms.x.unauthorized_dm_behavior: ignore` (no pairing-code DMs). See `docs/deploy.md`.
    - Checks before go-live, through the X channel: the live session's tool list is exactly
-     `web_search` and `todo_list`; the `touch /tmp/pwned-by-dm` DM runs nothing; a `/model` DM is
+     `web_search`; a first DM gets exactly one DM back; the `touch /tmp/pwned-by-dm` DM runs nothing; a `/model` DM is
      answered as text; an `@file:` DM gets no file content back.
 6. **Deploy.**
    - Read-only deploy key on the VM for this repo.
-   - `hermes plugins install "git@github.com:HuggerHustle/hermes-x-platform.git#plugin"
+   - `hermes plugins install "git@github.com:HuggerHustle/hermes-x.git#plugin"
 --ref <40-char sha> --enable`. The `owner/repo` shorthand resolves to HTTPS
      (`hermes_cli/plugins_cmd.py:333`) and cannot use the deploy key.
-   - Set `X_USER_ID` and `X_ALLOW_ALL_USERS=true`.
+   - Set `X_USER_ID`, `X_ALLOW_ALL_USERS=true` and `X_HOME_CHANNEL` (the bot's own id).
 7. **Cut over.** In this order: pause cron job "X DM responder"; confirm no
-   `x_dm_responder.py` process is running; restart the gateway. Keep the script one week as a
+   `x_dm_responder.py` process is running; delete any old `seen.json`; restart the gateway. Keep the script one week as a
    fallback, then delete it.
 8. **Document.** `AGENTS.md` and `docs/` in this repo, and the Linear ticket.
 
@@ -171,8 +175,10 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
   and the gateway log says so.
 - **The cursor skips late events.** Nothing older than the newest event of the last finished poll
   is answered. An event X delivers late, with an older timestamp, gets no reply.
-- **Paging assumes newest first.** X does not document the order of `/2/dm_events`. If it were
-  oldest first, no DM would be answered; go-live check 1 shows it either way.
+- **Paging relies on newest first.** X documents `/2/dm_events` as newest first
+  (docs.x.com, Direct Messages lookup). If that changed, no DM would be answered.
+- **Send limit.** X allows 15 DM sends per 15 minutes. A poll admits at most that many
+  conversations for its share of the window (5 at 300 s); the rest wait for the next poll.
 - **402 shape is a guess.** X does not document the body; detection matches a `CreditsDepleted`
   title or a `credits` type, else it is a generic API error.
 - **Hermes expands `@` references for every platform.** Upstream should skip expansion when
@@ -192,8 +198,8 @@ start a DM, and leaving it out means only the gateway process calls `xurl` for t
 
 ## Decisions
 
-- Repo name `hermes-x-platform`.
+- Repo name `hermes-x`.
 - OPS-30: only the X part is covered here.
 - Toolset `search`, not `web`: `web_extract` would let a stranger make Huggy fetch a URL they pick.
-- `todo` in the X toolset list: it keeps `x_search` off on a host with xAI credentials.
+- `context_engine` in the X toolset list: it keeps `x_search` off on a host with xAI credentials.
 - No cron delivery to X.

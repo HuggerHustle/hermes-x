@@ -11,7 +11,7 @@ against a scratch `HERMES_HOME`, not only read.
 
 | #   | Finding                        | Severity | Resolution                                  |
 | --- | ------------------------------ | -------- | ------------------------------------------- |
-| 1   | Extra toolsets reach X         | High     | `deploy.md`: `todo`, `known_plugin_toolsets` |
+| 1   | Extra toolsets reach X         | High     | `deploy.md`: `context_engine`, known list   |
 | 2   | `except A, B:` needs 3.14      | Low      | parenthesized; Black and ruff target 3.11   |
 | 3   | Pairing-code DMs to strangers  | Medium   | `deploy.md`: `unauthorized_dm_behavior`     |
 | 4   | Drain race drops a DM          | Medium   | `adapter.py`: check before each mark        |
@@ -45,8 +45,10 @@ Rejected fixes:
 - Any save through `hermes tools` (picker or `enable`/`disable`) drops `no_mcp`
   (`hermes_cli/tools_config.py:795`).
 
-Resolution (`docs/deploy.md`): `platform_toolsets.x: [search, todo, no_mcp]`. `todo` (a task
-list that lives only in the session) is a checklist key, so `x_search` stays off.
+Resolution (`docs/deploy.md`): `platform_toolsets.x: [search, context_engine, no_mcp]`.
+`context_engine` is a checklist key that adds no tool at the default engine, so `x_search` stays
+off. Not `todo`: its `todo_list` is deferred behind `tool_search`, which would also hide a leaked
+tool from go-live check 1.
 `known_plugin_toolsets.x` lists every plugin toolset key. The runbook says to edit these lists by
 hand, to move a newly enabled plugin's key out of `platform_toolsets.x`, and to re-run go-live
 check 1 after any plugin, toolset-list or context-engine change.
@@ -136,7 +138,7 @@ which DM is answered.
 
 | Check            | Command                                 | Result           |
 | ---------------- | --------------------------------------- | ---------------- |
-| Tests            | `uv run pytest -q`                      | 54 passed        |
+| Tests            | `uv run pytest -q`                      | 72 passed        |
 | Format           | `uv run black --check .`                | clean            |
 | Imports          | `uv run isort --check-only .`           | clean            |
 | Lint             | `uv run ruff check .`                   | clean            |
