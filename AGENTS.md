@@ -8,9 +8,6 @@ A Hermes Agent gateway platform plugin: Huggy answers classic X Direct Messages 
 | what it does, the shape, why        | `docs/plans/x-platform.md` |
 | VM config, install, cutover, checks | `docs/deploy.md`           |
 
-Linear: project `huggerhustle`. OPS-30 ("guard the agent") covers the guard on Huggy's other
-channels.
-
 ## Layout
 
 | Path                 | Owns                                                           |
